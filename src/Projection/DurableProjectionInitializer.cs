@@ -32,6 +32,9 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     private readonly int _batchSize;
     private readonly int _pageSize;
 
+    private readonly TaskOptions _durableTaskOptions;
+    private readonly RetryOptions _cosmosRetryOptions;
+
     /// <summary>
     /// Initializes a new instance of the <see cref="DurableProjectionInitializer{TProjection, TAggregate}"/> class.
     /// </summary>
@@ -40,7 +43,16 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     /// <param name="instanceId">The instance Id; only one orchestration can run at a time with this Id.</param>
     /// <param name="batchSize">The number of projections to initialize in a batch.</param>
     /// <param name="concurrentBatchCount">The number of concurrent batches to process.</param>
-    public DurableProjectionInitializer(HttpClient httpClient, INostify nostify, string instanceId, int batchSize = 1000, int concurrentBatchCount = 5)
+    /// <param name="durableTaskOptions">Retry options for the orchestrator - if null, default TaskOptions are used (see <see cref="CreateDefaultTaskOptions"/>)</param>
+    /// <param name="cosmosRetryOptions">Retry options for Cosmos DB operations - if null, default RetryOptions are used</param>
+    public DurableProjectionInitializer(
+        HttpClient httpClient,
+        INostify nostify,
+        string instanceId,
+        int batchSize = 1000,
+        int concurrentBatchCount = 5,
+        TaskOptions? durableTaskOptions = null,
+        RetryOptions? cosmosRetryOptions = null)
     {
         _httpClient = httpClient;
         _nostify = nostify;
@@ -48,6 +60,9 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
 
         _batchSize = batchSize;
         _pageSize = batchSize * concurrentBatchCount;
+
+        _durableTaskOptions = durableTaskOptions ?? CreateDefaultTaskOptions();
+        _cosmosRetryOptions = cosmosRetryOptions ?? new RetryOptions();
     }
 
     /// <summary>
@@ -129,13 +144,11 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
         )
     {
         // delete Projections
-        await context.CallActivityAsync(deleteActivityName);
+        await context.CallActivityAsync(deleteActivityName, null, _durableTaskOptions);
         logger?.LogInformation($"{_instanceId}: delete all projections");
 
-        var retryOptions = CreateRetryOptions();
-
         // get tenant ids to query by tenant partition
-        List<Guid> tenantIds = await context.CallActivityAsync<List<Guid>>(getTenantIdsActivityName);
+        List<Guid> tenantIds = await context.CallActivityAsync<List<Guid>>(getTenantIdsActivityName, null, _durableTaskOptions);
         logger?.LogInformation($"{_instanceId}: processing {tenantIds.Count} tenants");
 
         int totalProcessed = 0;
@@ -146,7 +159,6 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
                 context,
                 getIdsActivityName,
                 processBatchActivityName,
-                retryOptions,
                 pageNum => new DurableInitPageInfo(tenantId, pageNum),
                 count =>
                 {
@@ -179,13 +191,11 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
         )
     {
         // delete Projections
-        await context.CallActivityAsync(deleteActivityName);
+        await context.CallActivityAsync(deleteActivityName, null, _durableTaskOptions);
         logger?.LogInformation($"{_instanceId}: delete all projections");
 
-        var retryOptions = CreateRetryOptions();
-
         // get partition key values to page through
-        List<string> partitionKeys = await context.CallActivityAsync<List<string>>(getPartitionKeysActivityName);
+        List<string> partitionKeys = await context.CallActivityAsync<List<string>>(getPartitionKeysActivityName, null, _durableTaskOptions);
         logger?.LogInformation($"{_instanceId}: processing {partitionKeys.Count} partitions");
 
         int totalProcessed = 0;
@@ -196,7 +206,6 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
                 context,
                 getIdsActivityName,
                 processBatchActivityName,
-                retryOptions,
                 pageNum => new DurablePartitionInitPageInfo(pk, pageNum),
                 count =>
                 {
@@ -209,10 +218,10 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     }
 
     /// <summary>
-    /// Builds the standard retry policy used for all process-batch activity invocations:
+    /// Builds the default orchestrator retry policy used for all activity invocations when none is supplied to the constructor:
     /// 3 attempts, 5-second initial delay, 2x exponential backoff.
     /// </summary>
-    private static TaskOptions CreateRetryOptions()
+    public static TaskOptions CreateDefaultTaskOptions()
     {
         return new TaskOptions(TaskRetryOptions.FromRetryPolicy(new RetryPolicy(
             maxNumberOfAttempts: 3,
@@ -229,14 +238,13 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
         TaskOrchestrationContext context,
         string getIdsActivityName,
         string processBatchActivityName,
-        TaskOptions retryOptions,
         Func<int, TPageInfo> pageInfoFactory,
         Action<int> onPageProcessed)
     {
         int pageNum = 0;
         while (true)
         {
-            var pageIds = await context.CallActivityAsync<List<Guid>>(getIdsActivityName, pageInfoFactory(pageNum));
+            var pageIds = await context.CallActivityAsync<List<Guid>>(getIdsActivityName, pageInfoFactory(pageNum), _durableTaskOptions);
             if (pageIds.Count == 0)
             {
                 // no more ids to process
@@ -249,7 +257,7 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
             // this splits the pageIds into `concurrentBatchCount` batches with at most `_batchSize` ids
             var tasks = pageIds
                 .Chunk(_batchSize)
-                .Select(batch => context.CallActivityAsync(processBatchActivityName, batch.ToList(), retryOptions))
+                .Select(batch => context.CallActivityAsync(processBatchActivityName, batch.ToList(), _durableTaskOptions))
                 .ToList();
 
             await Task.WhenAll(tasks);
@@ -269,7 +277,10 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     public async Task DeleteAllProjections()
     {
         var container = await _nostify.GetBulkProjectionContainerAsync<TProjection>();
-        await container.DeleteAllBulkAsync<TProjection>();
+        List<TProjection> allProjections = await container.WithRetry(_cosmosRetryOptions)
+            .GetItemLinqQueryable<TProjection>()
+            .ReadAllAsync();
+        await container.BulkDeleteAsync(allProjections, _cosmosRetryOptions);
     }
 
     /// <summary>
@@ -278,7 +289,8 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     public async Task<List<Guid>> GetDistinctTenantIds()
     {
         var container = await _nostify.GetCurrentStateContainerAsync<TAggregate>();
-        return await container.GetItemLinqQueryable<TAggregate>()
+        return await container.WithRetry(_cosmosRetryOptions)
+            .GetItemLinqQueryable<TAggregate>()
             .Select(x => x.tenantId)
             .Distinct()
             .ReadAllAsync();
@@ -295,7 +307,8 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     public async Task<List<string>> GetDistinctPartitionKeys<TKey>(Expression<Func<TAggregate, TKey>> partitionKeySelector)
     {
         var container = await _nostify.GetCurrentStateContainerAsync<TAggregate>();
-        var values = await container.GetItemLinqQueryable<TAggregate>()
+        var values = await container.WithRetry(_cosmosRetryOptions)
+            .GetItemLinqQueryable<TAggregate>()
             .Select(partitionKeySelector)
             .Distinct()
             .ReadAllAsync();
@@ -326,7 +339,8 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     {
         var container = await _nostify.GetCurrentStateContainerAsync<TAggregate>();
 
-        return await container.FilteredQuery<TAggregate>(partitionKey)
+        return await container.WithRetry(_cosmosRetryOptions)
+            .FilteredQuery<TAggregate>(partitionKey)
             .Where(x => !x.isDeleted)
             .OrderBy(x => x.id)
             .Skip(pageNumber * _pageSize)
@@ -343,7 +357,8 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     {
         // get events from event store
         var eventStore = await _nostify.GetEventStoreContainerAsync();
-        var events = await eventStore.GetItemLinqQueryable<Event>()
+        var events = await eventStore.WithRetry(_cosmosRetryOptions)
+            .GetItemLinqQueryable<Event>()
             .Where(x => ids.Contains(x.aggregateRootId))
             .ReadAllAsync();
 
@@ -356,7 +371,7 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
         }).ToList();
 
         // initialize projections
-        await _nostify.ProjectionInitializer.InitAsync(projections, _nostify, _httpClient);
+        await _nostify.ProjectionInitializer.InitAsync(projections, _nostify, _httpClient, null, _cosmosRetryOptions);
     }
 }
 
