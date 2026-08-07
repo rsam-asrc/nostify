@@ -5,6 +5,7 @@ using System.Linq;
 using System.Linq.Expressions;
 using System.Net;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 
 using Microsoft.Azure.Cosmos;
@@ -79,8 +80,8 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     {
         var existing = await client.GetInstanceAsync(_instanceId);
 
-        // only allow one orchestration to run at a time — block if Running (IsRunning) or Pending
-        if (existing != null && (existing.IsRunning || existing.RuntimeStatus == OrchestrationRuntimeStatus.Pending))
+        // only allow one orchestration to run at a time — block if the instance is still active
+        if (IsInstanceActive(existing))
         {
             // already active, return 409 Conflict
             var conflict = req.CreateResponse(HttpStatusCode.Conflict);
@@ -93,7 +94,7 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     }
 
     /// <summary>
-    /// Cancels the durable orchestration if it is running, and purges the instance after cancellation.
+    /// Cancels the durable orchestration if it is active, and purges the instance after cancellation.
     /// </summary>
     /// <param name="req">The HTTP request data from the Azure Function.</param>
     /// <param name="client">The durable task client injected by the Azure host.</param>
@@ -106,8 +107,14 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
         var existing = await client.GetInstanceAsync(_instanceId);
         if (existing != null)
         {
-            if (existing.RuntimeStatus == OrchestrationRuntimeStatus.Running)
+            if (IsInstanceActive(existing))
             {
+                // resum a suspended ochestration so that it can be terminated
+                if (existing.RuntimeStatus == OrchestrationRuntimeStatus.Suspended)
+                {
+                    await client.ResumeInstanceAsync(_instanceId, $"{_instanceId} resumed to cancel");
+                }
+
                 await client.TerminateInstanceAsync(_instanceId, $"{_instanceId} cancelled");
                 await client.WaitForInstanceCompletionAsync(_instanceId);
 
@@ -123,6 +130,24 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
 
         return resp;
     }
+
+    /// <summary>
+    /// Checks if an activity should be cancelled
+    /// </summary>
+    public async Task<bool> IsCancellationRequestedAsync(DurableTaskClient client, CancellationToken cancellationToken = default)
+    {
+        var existing = await client.GetInstanceAsync(_instanceId, false, cancellationToken);
+        return !IsInstanceActive(existing);
+    }
+
+    /// <summary>
+    /// Checks if an orchestration is active
+    /// </summary>
+    private static bool IsInstanceActive(OrchestrationMetadata? metadata)
+        => metadata != null
+            && (metadata.RuntimeStatus == OrchestrationRuntimeStatus.Running
+                || metadata.RuntimeStatus == OrchestrationRuntimeStatus.Pending
+                || metadata.RuntimeStatus == OrchestrationRuntimeStatus.Suspended);
 
     /// <summary>
     /// The orchestrator that runs the projection initialization logic, paging through aggregates by tenant partition.
@@ -274,8 +299,16 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     /// <summary>
     /// Deletes all projections of <typeparamref name="TProjection"/> from the bulk container.
     /// </summary>
-    public async Task DeleteAllProjections()
+    /// <param name="client">
+    /// Optional durable task client, used to check for cancellation.
+    /// </param>
+    public async Task DeleteAllProjections(DurableTaskClient? client = null)
     {
+        if (client != null && await IsCancellationRequestedAsync(client))
+        {
+            return;
+        }
+
         var container = await _nostify.GetBulkProjectionContainerAsync<TProjection>();
         List<TProjection> allProjections = await container.WithRetry(_cosmosRetryOptions)
             .GetItemLinqQueryable<TProjection>()
@@ -353,8 +386,16 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
     /// Replays events for a batch of aggregate Ids and initializes their projections.
     /// </summary>
     /// <param name="ids">Aggregate Ids to process.</param>
-    public async Task ProcessBatch(List<Guid> ids)
+    /// <param name="client">
+    /// Optional durable task client, used to check for cancellation.
+    /// </param>
+    public async Task ProcessBatch(List<Guid> ids, DurableTaskClient? client = null)
     {
+        if (client != null && await IsCancellationRequestedAsync(client))
+        {
+            return;
+        }
+
         // get events from event store
         var eventStore = await _nostify.GetEventStoreContainerAsync();
         var events = await eventStore.WithRetry(_cosmosRetryOptions)
@@ -369,6 +410,12 @@ public class DurableProjectionInitializer<TProjection, TAggregate>
             events.Where(e => e.aggregateRootId == id).ToList().ForEach(e => p.Apply(e));
             return p;
         }).ToList();
+
+        // check for cancellation again right before InitAsync - last chance to cancel before processing this batch
+        if (client != null && await IsCancellationRequestedAsync(client))
+        {
+            return;
+        }
 
         // initialize projections
         await _nostify.ProjectionInitializer.InitAsync(projections, _nostify, _httpClient, null, _cosmosRetryOptions);
