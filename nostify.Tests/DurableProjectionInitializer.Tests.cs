@@ -1575,8 +1575,9 @@ public class DurableProjectionInitializerTests
 
     #endregion
 
-    #region Cooperative Cancellation Tests
+    #region Cancellation Tests
 
+    // Report cancelled for any orchestration that is done - Completed, Failed, Terminated, Canceled
     [Theory]
     [InlineData(OrchestrationRuntimeStatus.Running, false)]
     [InlineData(OrchestrationRuntimeStatus.Pending, false)]
@@ -1584,6 +1585,7 @@ public class DurableProjectionInitializerTests
     [InlineData(OrchestrationRuntimeStatus.Terminated, true)]
     [InlineData(OrchestrationRuntimeStatus.Completed, true)]
     [InlineData(OrchestrationRuntimeStatus.Failed, true)]
+    // .Canceled is obsolete, but test it anyways
     [InlineData(OrchestrationRuntimeStatus.Canceled, true)]
     public async Task IsCancellationRequestedAsync_ReportsCancelledForDoneTasks(
         OrchestrationRuntimeStatus status,
